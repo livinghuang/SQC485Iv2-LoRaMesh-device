@@ -136,7 +136,11 @@ int32_t PLCModbusModule::runOnce()
     if (firstTime) {
         firstTime = false;
         rs485Begin();
-        LOG_INFO("PLCModbusModule: RS485 init 9600 8N1, FC03 slave 0x01; first poll in 3s");
+        // Priming transaction: the very first RS485 read can mis-align while the
+        // line/echo settles. Discard it so the first forwarded packet is clean.
+        uint8_t prime[32];
+        (void)pollModbus(prime, sizeof(prime));
+        LOG_INFO("PLCModbusModule: RS485 init 9600 8N1, FC03 slave 0x01; priming done, first uplink in 3s");
         return 3000;
     }
 
