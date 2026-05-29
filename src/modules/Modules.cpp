@@ -21,6 +21,7 @@
 #endif
 #if !MESHTASTIC_EXCLUDE_DETECTIONSENSOR
 #include "modules/DetectionSensorModule.h"
+#include "modules/PLCModbusModule.h"
 #endif
 #if !MESHTASTIC_EXCLUDE_NEIGHBORINFO
 #include "modules/NeighborInfoModule.h"
@@ -173,6 +174,9 @@ void setupModules()
 #endif
     // Example: Put your module here
     // new ReplyModule();
+#ifdef SQC485IV2
+    plcModbusModule = new PLCModbusModule(); // NAFCO field-node RS485 Modbus -> mesh (portnum 256)
+#endif
 #if HAS_SCREEN && !MESHTASTIC_EXCLUDE_CANNEDMESSAGES
     if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
         cannedMessageModule = new CannedMessageModule();

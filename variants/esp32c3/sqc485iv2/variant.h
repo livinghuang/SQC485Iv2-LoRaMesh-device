@@ -5,11 +5,16 @@
 // - LED: GPIO2 (schematic note: LED on when GPIO2 == LOW)
 // - Battery ADC measurement is not implemented/available on this board revision.
 
-#define BUTTON_PIN 9
+// GPIO9 (user key) and GPIO2 (LED) are NOT exposed on this headless board; they
+// are reused for the RS485 transceiver so the field node can poll a Modbus PLC.
+// No BUTTON_PIN / LED_POWER is defined — they would conflict with RS485 DE//RE.
 
-// LED pin (HT-CT62 reference design compatible)
-#define LED_POWER 2    // LED
-#define LED_STATE_ON 1 // State when LED is lit
+// RS485 (MAX3485) — same wiring as the LoRaWAN v2 board (SQ_NAFCO_V230)
+#define SQC485I_RS485_RX 0    // RO (receiver out -> ESP RX)
+#define SQC485I_RS485_TX 1    // DI (ESP TX -> driver in)
+#define SQC485I_RS485_DE 9    // driver enable (was the unexposed user key)
+#define SQC485I_RS485_RE 2    // /RE, held LOW = receive (was the unexposed LED)
+#define SQC485I_DE_INVERTED 1 // Lot 2+: GPIO9 -> inverter -> DE
 
 #define HAS_SCREEN 0
 #define HAS_GPS 0
