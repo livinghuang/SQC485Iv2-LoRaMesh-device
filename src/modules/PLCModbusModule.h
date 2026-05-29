@@ -1,9 +1,11 @@
 #pragma once
 
 // PLCModbusModule — SQC485Iv2 field node only.
-// Polls a generic Modbus-RTU slave over RS485 (FC03, slave 0x01) every 15 s and
-// forwards the raw response (CRC stripped) over the mesh on portnum PRIVATE_APP (256).
-// Gateway nodes (role=CLIENT_MUTE) do not poll. Built only when -D SQC485IV2.
+// Polls a generic Modbus-RTU slave over RS485 (FC03, slave 0x01) every 15 s, packs
+// the response into the 51-byte Rs485Payload struct that the USB receiver
+// (project 08_nafco_sqc485i_meshtastic_usb_receiver) decodes, and sends it over the
+// mesh on portnum PRIVATE_APP (256). Gateway nodes (role=CLIENT_MUTE) do not poll.
+// Built only when -D SQC485IV2.
 
 #ifdef SQC485IV2
 

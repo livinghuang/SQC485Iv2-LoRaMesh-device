@@ -144,23 +144,29 @@ int32_t PLCModbusModule::runOnce()
         return 3000;
     }
 
-    uint8_t payload[32];
-    size_t n = pollModbus(payload, sizeof(payload));
+    uint8_t rs485[22]; // [addr][func][20 data] on success
+    size_t n = pollModbus(rs485, sizeof(rs485));
+
+    // Build the 51-byte Rs485Payload the USB receiver (project 08) decodes:
+    //   uint32 id (dedup nonce) + uint8 data[47]
+    //   data[0]=type (0x01 Modbus OK / 0xFF error), data[1]=rst_reason,
+    //   data[2..23]=22 RS485 bytes, data[24..46]=reserved.
+    uint8_t pkt[51];
+    memset(pkt, 0, sizeof(pkt));
+    uint32_t nonce = esp_random();
+    memcpy(pkt, &nonce, 4);
+    pkt[4] = (n > 0) ? 0x01 : 0xFF;       // type
+    pkt[5] = (uint8_t)esp_reset_reason(); // rst_reason
+    if (n > 0)
+        memcpy(pkt + 6, rs485, n > 22 ? 22 : n); // data[2..23]
 
     meshtastic_MeshPacket *p = allocDataPacket();
     if (!p)
         return MODBUS_POLL_INTERVAL_MS;
     p->want_ack = false;
-    if (n > 0) {
-        p->decoded.payload.size = n;
-        memcpy(p->decoded.payload.bytes, payload, n);
-        LOG_INFO("PLCModbus: forward %u bytes on portnum 256", (unsigned)n);
-    } else {
-        const uint8_t err[4] = {0x00, 0x01, 0x02, 0x03};
-        p->decoded.payload.size = sizeof(err);
-        memcpy(p->decoded.payload.bytes, err, sizeof(err));
-        LOG_WARN("PLCModbus: no/invalid PLC response — send error marker");
-    }
+    p->decoded.payload.size = sizeof(pkt);
+    memcpy(p->decoded.payload.bytes, pkt, sizeof(pkt));
+    LOG_INFO("PLCModbus: tx Rs485Payload type=0x%02X (%u RS485 bytes) on portnum 256", pkt[4], (unsigned)(n > 0 ? n : 0));
     service->sendToMesh(p);
     return MODBUS_POLL_INTERVAL_MS;
 }
