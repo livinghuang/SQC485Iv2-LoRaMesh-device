@@ -35,6 +35,8 @@ PLCModbusModule *plcModbusModule;
 #define MODBUS_EXPECTED_RESP 25      // addr+func+bytecount+20 data+CRC(2)
 #define MODBUS_POLL_INTERVAL_MS 15000
 #define MODBUS_RX_TIMEOUT_MS 500
+#define MODBUS_MAX_ATTEMPTS 3   // read attempts per 15s cycle before reporting an error
+#define MODBUS_RETRY_GAP_MS 50  // settle gap between attempts
 
 PLCModbusModule::PLCModbusModule()
     : SinglePortModule("plcmodbus", meshtastic_PortNum_PRIVATE_APP), OSThread("PLCModbus")
@@ -145,7 +147,18 @@ int32_t PLCModbusModule::runOnce()
     }
 
     uint8_t rs485[22]; // [addr][func][20 data] on success
-    size_t n = pollModbus(rs485, sizeof(rs485));
+    // Retry the Modbus read up to MODBUS_MAX_ATTEMPTS times within this cycle;
+    // a single read can fail transiently (bus noise, slave busy). Only report an
+    // error once every attempt has failed.
+    size_t n = 0;
+    int attempt = 0;
+    for (; attempt < MODBUS_MAX_ATTEMPTS; attempt++) {
+        n = pollModbus(rs485, sizeof(rs485));
+        if (n > 0)
+            break;
+        if (attempt + 1 < MODBUS_MAX_ATTEMPTS)
+            delay(MODBUS_RETRY_GAP_MS);
+    }
 
     // Build the 51-byte Rs485Payload the USB receiver (project 08) decodes:
     //   uint32 id (dedup nonce) + uint8 data[47]
@@ -157,8 +170,13 @@ int32_t PLCModbusModule::runOnce()
     memcpy(pkt, &nonce, 4);
     pkt[4] = (n > 0) ? 0x01 : 0xFF;       // type
     pkt[5] = (uint8_t)esp_reset_reason(); // rst_reason
-    if (n > 0)
+    if (n > 0) {
         memcpy(pkt + 6, rs485, n > 22 ? 22 : n); // data[2..23]
+    } else {
+        // All MODBUS_MAX_ATTEMPTS reads failed — emit the fixed error code.
+        static const uint8_t errCode[4] = {0x01, 0x02, 0x03, 0x04};
+        memcpy(pkt + 6, errCode, sizeof(errCode)); // data[2..5] = 01 02 03 04
+    }
 
     meshtastic_MeshPacket *p = allocDataPacket();
     if (!p)
@@ -166,7 +184,10 @@ int32_t PLCModbusModule::runOnce()
     p->want_ack = false;
     p->decoded.payload.size = sizeof(pkt);
     memcpy(p->decoded.payload.bytes, pkt, sizeof(pkt));
-    LOG_INFO("PLCModbus: tx Rs485Payload type=0x%02X (%u RS485 bytes) on portnum 256", pkt[4], (unsigned)(n > 0 ? n : 0));
+    if (n > 0)
+        LOG_INFO("PLCModbus: tx Rs485Payload type=0x01 (%u RS485 bytes) on portnum 256", (unsigned)n);
+    else
+        LOG_WARN("PLCModbus: read failed after %d attempts; tx type=0xFF errcode=01 02 03 04 on portnum 256", MODBUS_MAX_ATTEMPTS);
     service->sendToMesh(p);
     return MODBUS_POLL_INTERVAL_MS;
 }
