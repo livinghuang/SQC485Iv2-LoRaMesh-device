@@ -14,7 +14,9 @@
 #define SQC485I_RS485_TX 1    // DI (ESP TX -> driver in)
 #define SQC485I_RS485_DE 9    // driver enable (was the unexposed user key)
 #define SQC485I_RS485_RE 2    // /RE, held LOW = receive (was the unexposed LED)
-#define SQC485I_DE_INVERTED 1 // Lot 2+: GPIO9 -> inverter -> DE
+#ifndef SQC485I_DE_INVERTED
+#define SQC485I_DE_INVERTED 1 // Lot 2+ default: GPIO9 -> inverter -> DE. v231 env overrides to 0 via -D.
+#endif
 
 #define HAS_SCREEN 0
 #define HAS_GPS 0
