@@ -85,21 +85,34 @@ void ModbusModule::pollAndSend()
     p->want_ack = false;
     memcpy(p->decoded.payload.bytes, payload, len);
     p->decoded.payload.size = len;
-    LOG_INFO("ModbusModule: tx raw-forward %u bytes on portnum %u", (unsigned)len,
-             (unsigned)SILIQS_MODBUS_PORTNUM);
+    // Log the payload hex (capped) — lets the installer see the actual forwarded
+    // bytes on the console; a node's own mesh broadcasts don't always reach the
+    // phone API, so this is the reliable bench read-back.
+    char hx[2 * 32 + 1];
+    size_t hn = len < 32 ? len : 32;
+    for (size_t i = 0; i < hn; i++)
+        snprintf(hx + 2 * i, 3, "%02x", payload[i]);
+    hx[2 * hn] = 0;
+    LOG_INFO("ModbusModule: tx raw-forward %u bytes on portnum %u: %s", (unsigned)len,
+             (unsigned)SILIQS_MODBUS_PORTNUM, hx);
     service->sendToMesh(p);   // broadcast; an MQTT-gateway node forwards it onward
 }
 
 ProcessMessage ModbusModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
-    // SinglePortModule already filtered to our PortNum. Ignore our own uplinks
-    // (we both send and receive on this port); only act on remote downlinks.
-    if (mp.from == 0 || mp.from == nodeDB->getNodeNum())
+    // Config downlinks and our own telemetry uplinks share this PortNum, and we
+    // CANNOT tell them apart by source: a companion app provisions by injecting
+    // the config on the LOCAL node's Meshtastic API, so its packet is from==self,
+    // exactly like our telemetry loopback. So let CONTENT decide — only a valid
+    // 'SQ' blob (magic+version+length+CRC16, checked by config_from_blob) is
+    // treated as config; raw-forward telemetry fails that and is ignored. A cheap
+    // magic pre-check keeps our own uplinks from spamming the debug log.
+    const uint8_t *b = mp.decoded.payload.bytes;
+    size_t n = mp.decoded.payload.size;
+    if (n < 4 || b[0] != 'S' || b[1] != 'Q')
         return ProcessMessage::CONTINUE;
 
-    // config_from_blob validates 'SQ' magic + version + length + CRC16, so a
-    // stray telemetry/text packet on this port is simply rejected here.
-    applyConfigBlob(mp.decoded.payload.bytes, mp.decoded.payload.size, mp.from);
+    applyConfigBlob(b, n, mp.from);
     return ProcessMessage::CONTINUE;
 }
 
