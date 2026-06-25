@@ -23,6 +23,9 @@
 #include "modules/DetectionSensorModule.h"
 #include "modules/PLCModbusModule.h"
 #endif
+#ifdef SQC485IV2
+#include "modules/ModbusModule.h"
+#endif
 #if !MESHTASTIC_EXCLUDE_NEIGHBORINFO
 #include "modules/NeighborInfoModule.h"
 #endif
@@ -175,7 +178,10 @@ void setupModules()
     // Example: Put your module here
     // new ReplyModule();
 #ifdef SQC485IV2
-    plcModbusModule = new PLCModbusModule(); // NAFCO field-node RS485 Modbus -> mesh (portnum 256)
+    // Generic config-driven RS485 Modbus -> mesh (raw-forward on portnum 256),
+    // reusing the shared firmware_core engine. Replaces the hardcoded NAFCO
+    // PLCModbusModule; per-deployment behaviour now comes from the config blob.
+    modbusModule = new ModbusModule();
 #endif
 #if HAS_SCREEN && !MESHTASTIC_EXCLUDE_CANNEDMESSAGES
     if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
