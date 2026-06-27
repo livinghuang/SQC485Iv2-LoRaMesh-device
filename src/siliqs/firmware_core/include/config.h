@@ -76,7 +76,11 @@ typedef struct {
     sq_poll_t    polls[SQ_MAX_POLLS];    /* the configurable poll list */
     sq_power_t   power;
     sq_tx_t      tx;                      /* telemetry destination (Mesh) */
+    bool         rs485_enabled;          /* false = don't poll RS485 (no sensor wired) */
 } sq_config_t;
+
+/* blob flags byte (offset 3) */
+#define SQ_FLAG_RS485_OFF 0x01
 
 void config_set_defaults(sq_config_t *c);
 bool config_load(sq_config_t *c);

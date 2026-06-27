@@ -51,6 +51,11 @@ int32_t ModbusModule::runOnce()
     if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE)
         return disable();
 
+    // RS485 polling turned off (e.g. no sensor wired) — stay idle, but keep
+    // checking so a config push can re-enable it without a reboot.
+    if (!g_cfg.rs485_enabled)
+        return 5000;
+
     if (firstTime) {
         firstTime = false;
         // Bring up RS485 at the configured link params (one-shot; not per-poll).

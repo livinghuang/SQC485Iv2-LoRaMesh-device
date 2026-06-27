@@ -83,6 +83,7 @@ void config_set_defaults(sq_config_t *c)
 
     c->tx.dest_node = 0;   /* broadcast */
     c->tx.channel   = 0;   /* primary */
+    c->rs485_enabled = true;
 }
 
 bool config_load(sq_config_t *c)
@@ -122,7 +123,8 @@ size_t config_to_blob(const sq_config_t *c, uint8_t *out, size_t cap)
     size_t need = SQ_BLOB_HDR + (size_t)c->poll_count * 6 + 5 + 2;
     if (need > cap) return 0;
 
-    out[0] = 'S'; out[1] = 'Q'; out[2] = SQ_CONFIG_VERSION & 0xFF; out[3] = 0;
+    out[0] = 'S'; out[1] = 'Q'; out[2] = SQ_CONFIG_VERSION & 0xFF;
+    out[3] = c->rs485_enabled ? 0 : SQ_FLAG_RS485_OFF;   /* flags */
     memset(out + 4, 0, 16);
     for (int i = 0; i < 16 && c->device_name[i]; i++) out[4 + i] = (uint8_t)c->device_name[i];
     put_u32(out + 20, c->modbus.baud);
@@ -162,6 +164,7 @@ bool config_from_blob(sq_config_t *c, const uint8_t *b, size_t len)
     if (get_u16(b + need - 2) != modbus_crc16(b, need - 2)) return false;
 
     /* preserve c->lorawan; overwrite the deployment fields */
+    c->rs485_enabled = (b[3] & SQ_FLAG_RS485_OFF) ? false : true;
     memset(c->device_name, 0, SQ_NAME_LEN);
     memcpy(c->device_name, b + 4, 16);
     c->device_name[SQ_NAME_LEN - 1] = 0;
