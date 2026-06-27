@@ -80,6 +80,9 @@ void config_set_defaults(sq_config_t *c)
 
     c->power.uplink_interval_s = 60;
     c->power.deep_sleep        = true;
+
+    c->tx.dest_node = 0;   /* broadcast */
+    c->tx.channel   = 0;   /* primary */
 }
 
 bool config_load(sq_config_t *c)
@@ -115,7 +118,8 @@ static uint32_t get_u32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p
 
 size_t config_to_blob(const sq_config_t *c, uint8_t *out, size_t cap)
 {
-    size_t need = SQ_BLOB_HDR + (size_t)c->poll_count * 6 + 2;
+    /* v3 appends tx routing (dest_node u32 + channel u8 = 5 bytes) after the polls. */
+    size_t need = SQ_BLOB_HDR + (size_t)c->poll_count * 6 + 5 + 2;
     if (need > cap) return 0;
 
     out[0] = 'S'; out[1] = 'Q'; out[2] = SQ_CONFIG_VERSION & 0xFF; out[3] = 0;
@@ -137,6 +141,9 @@ size_t config_to_blob(const sq_config_t *c, uint8_t *out, size_t cap)
         put_u16(q + 2, p->reg_start);
         put_u16(q + 4, p->reg_count);
     }
+    uint8_t *t = out + SQ_BLOB_HDR + (size_t)c->poll_count * 6;   /* tx routing (v3) */
+    put_u32(t, c->tx.dest_node);
+    t[4] = c->tx.channel;
     put_u16(out + need - 2, modbus_crc16(out, need - 2));
     return need;
 }
@@ -144,11 +151,13 @@ size_t config_to_blob(const sq_config_t *c, uint8_t *out, size_t cap)
 bool config_from_blob(sq_config_t *c, const uint8_t *b, size_t len)
 {
     if (len < SQ_BLOB_HDR + 2) return false;
-    if (b[0] != 'S' || b[1] != 'Q' || b[2] != (SQ_CONFIG_VERSION & 0xFF)) return false;
+    uint8_t ver = b[2];
+    if (b[0] != 'S' || b[1] != 'Q' || (ver != 2 && ver != 3)) return false;
 
     uint8_t pc = b[36];
     if (pc > SQ_MAX_POLLS) return false;
-    size_t need = SQ_BLOB_HDR + (size_t)pc * 6 + 2;
+    size_t extra = (ver >= 3) ? 5 : 0;                       /* v3 tx routing block */
+    size_t need = SQ_BLOB_HDR + (size_t)pc * 6 + extra + 2;
     if (len != need) return false;
     if (get_u16(b + need - 2) != modbus_crc16(b, need - 2)) return false;
 
@@ -175,6 +184,14 @@ bool config_from_blob(sq_config_t *c, const uint8_t *b, size_t len)
         p->reg_count = get_u16(q + 4);
         p->type      = SQ_TYPE_RAW;   /* device read-plan; real type is cloud-side */
         p->scale     = 1.0f;
+    }
+    if (ver >= 3) {
+        const uint8_t *t = b + SQ_BLOB_HDR + (size_t)pc * 6;
+        c->tx.dest_node = get_u32(t);
+        c->tx.channel   = t[4];
+    } else {
+        c->tx.dest_node = 0;          /* v2 blob: broadcast on primary */
+        c->tx.channel   = 0;
     }
     c->schema_version = SQ_CONFIG_VERSION;
     return true;

@@ -7,7 +7,7 @@
 #include <stdbool.h>
 #include "hal/hal_serial.h"   /* hal_parity_t */
 
-#define SQ_CONFIG_VERSION 2     /* bumped: LPP fields removed, raw-forward model */
+#define SQ_CONFIG_VERSION 3     /* v3: + tx routing (dest_node + channel); v2 still accepted */
 #define SQ_MAX_POLLS      8
 #define SQ_MAX_REGS       16    /* registers per poll */
 #define SQ_NAME_LEN       24
@@ -61,6 +61,12 @@ typedef struct {
     bool     deep_sleep;
 } sq_power_t;
 
+/* Where the Mesh node sends its raw-forward telemetry (Mesh version only). */
+typedef struct {
+    uint32_t dest_node;   /* 0 = broadcast; else unicast to this node num */
+    uint8_t  channel;     /* mesh channel index (0 = primary) */
+} sq_tx_t;
+
 typedef struct {
     uint16_t     schema_version;
     char         device_name[SQ_NAME_LEN];
@@ -69,6 +75,7 @@ typedef struct {
     uint8_t      poll_count;
     sq_poll_t    polls[SQ_MAX_POLLS];    /* the configurable poll list */
     sq_power_t   power;
+    sq_tx_t      tx;                      /* telemetry destination (Mesh) */
 } sq_config_t;
 
 void config_set_defaults(sq_config_t *c);

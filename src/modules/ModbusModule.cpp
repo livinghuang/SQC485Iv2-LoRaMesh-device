@@ -83,6 +83,11 @@ void ModbusModule::pollAndSend()
     if (!p)
         return;
     p->want_ack = false;
+    // Telemetry destination (config v3): unicast to a chosen node, or broadcast
+    // (the allocDataPacket default); and the chosen mesh channel index.
+    if (g_cfg.tx.dest_node)
+        p->to = g_cfg.tx.dest_node;
+    p->channel = g_cfg.tx.channel;
     memcpy(p->decoded.payload.bytes, payload, len);
     p->decoded.payload.size = len;
     // Log the payload hex (capped) — lets the installer see the actual forwarded
