@@ -113,22 +113,14 @@ ProcessMessage ModbusModule::handleReceived(const meshtastic_MeshPacket &mp)
     const uint8_t *b = mp.decoded.payload.bytes;
     size_t n = mp.decoded.payload.size;
 
-    // Poll-now test request: the 3 bytes 'S','Q','?'. Read RS485 immediately and
-    // reply (raw-forward) to the requester, cc'd to the phone so a connected
-    // configurator gets an on-demand read without waiting for the next interval.
-    // (A config blob is 'S','Q',ver(=2),… so byte[2]='?' can't collide with it.)
+    // Poll-now test request: the 3 bytes 'S','Q','?'. Do an immediate read and
+    // send it the SAME way as a periodic read — pollAndSend() broadcasts + cc's to
+    // the phone, which reliably reaches a connected configurator. (An addressed
+    // self-reply was unreliable; the broadcast path is the one that works.)
+    // A config blob is 'S','Q',ver(=2),… so byte[2]='?' can't collide with it.
     if (n >= 3 && b[0] == 'S' && b[1] == 'Q' && b[2] == '?') {
-        uint8_t payload[meshtastic_Constants_DATA_PAYLOAD_LEN];
-        size_t len = poll_collect_raw(&g_cfg, payload, sizeof(payload));
-        meshtastic_MeshPacket *p = (len > 0) ? allocDataPacket() : nullptr;
-        if (p) {
-            p->to = mp.from;          // reply to whoever asked
-            p->want_ack = false;
-            memcpy(p->decoded.payload.bytes, payload, len);
-            p->decoded.payload.size = len;
-            service->sendToMesh(p, RX_SRC_LOCAL, true);   // cc to the connected client
-            LOG_INFO("ModbusModule: poll-now reply %u bytes to 0x%08x", (unsigned)len, (unsigned)mp.from);
-        }
+        LOG_INFO("ModbusModule: poll-now request — reading + broadcasting");
+        pollAndSend();
         return ProcessMessage::CONTINUE;
     }
 
