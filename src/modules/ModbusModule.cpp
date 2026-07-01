@@ -26,17 +26,52 @@
 #include "NodeDB.h"
 #include "configuration.h"
 #include "main.h"
+#include <NimBLEDevice.h>   // NimBLEDevice::setPower (BLE TX power control)
 
 extern "C" {
 #include "config.h"          // sq_config_t, config_load/save, config_from_blob
 #include "poll.h"            // poll_collect_raw  (raw-forward payload)
-#include "hal/hal_serial.h"  // hal_serial_init (re-init UART on baud change)
+#include "hal/hal_serial.h"  // hal_serial_init + raw write/read (USB↔RS485 bridge)
+#include "hal/hal_time.h"    // hal_millis (idle-gap framing for the RS485 tunnel)
+#include "hal/hal_store.h"   // persist the BLE TX power (separate key, not the blob)
+#include "board_profile.h"   // BOARD.rs485_tx_echo (strip half-duplex TX echo)
 }
 
 ModbusModule *modbusModule;
 
 // Shared config (loaded from our LittleFS store via hal_store in hal_meshtastic.cpp).
 static sq_config_t g_cfg;
+
+// Tunnel source/sink. Default = the local RS485 (Serial1 via the HAL). In the
+// SQ_USB_TUNNEL build the source/sink is the USB CDC (Serial) instead — the console
+// is moved off USB (USER_DEBUG_PORT=g_nullStream) so the port is free for raw data.
+// The mesh side (forwardTunnel '/SQ}', peer reply '/SQ{') is identical either way.
+#ifdef SQ_USB_TUNNEL
+static inline int  tun_read(uint8_t *buf, size_t len) {
+    size_t n = 0;
+    while (n < len && Serial.available()) buf[n++] = (uint8_t)Serial.read();
+    return (int)n;
+}
+static inline void tun_write(const uint8_t *buf, size_t len) { Serial.write(buf, len); }
+#else
+static inline int  tun_read(uint8_t *buf, size_t len) { return hal_serial_read(buf, len, 2); }
+static inline void tun_write(const uint8_t *buf, size_t len) {
+    hal_serial_set_tx(true);
+    hal_serial_write(buf, len);
+    hal_serial_flush();
+    hal_serial_set_tx(false);
+    // Discard our own TX echo so the framer doesn't re-forward it (half-duplex RS485).
+    if (BOARD.rs485_tx_echo) {
+        uint8_t scratch[64];
+        size_t echo = len;
+        while (echo) {
+            int n = hal_serial_read(scratch, echo < sizeof(scratch) ? echo : sizeof(scratch), 50);
+            if (n <= 0) break;
+            echo -= (size_t)n;
+        }
+    }
+}
+#endif
 
 ModbusModule::ModbusModule()
     : SinglePortModule("modbus", SILIQS_MODBUS_PORTNUM),
@@ -47,9 +82,39 @@ ModbusModule::ModbusModule()
 
 int32_t ModbusModule::runOnce()
 {
+    // One-shot at startup: re-apply the saved BLE TX power (BLE is up by now). Done
+    // here (not in main) to keep the change in our module; harmless if never set.
+    if (!blePowerApplied) {
+        blePowerApplied = true;
+        int8_t dbm;
+        if (hal_store_get("blepwr", &dbm, sizeof(dbm)) == (int)sizeof(dbm))
+            applyBlePower((int)dbm, false);
+    }
+
     // Gateway nodes (CLIENT_MUTE) bridge the mesh to MQTT and must not poll RS485.
     if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE)
         return disable();
+
+    // Tunnel master: instead of polling, read raw frames off the local port and
+    // forward them to the peer (its reply is written back in handleReceived). The
+    // local port is RS485 normally, or the USB CDC in the SQ_USB_TUNNEL build.
+    if (g_cfg.tunnel.enabled) {
+        if (firstTime) {
+            firstTime = false;
+#ifdef SQ_USB_TUNNEL
+            Serial.begin(g_cfg.modbus.baud);   // USB CDC: baud is cosmetic, ensures open
+            LOG_INFO("ModbusModule: USB<->USB pipe <-> node 0x%08x (gap %ums)",
+                     (unsigned)g_cfg.tunnel.peer_node, (unsigned)g_cfg.tunnel.idle_gap_ms);
+#else
+            hal_serial_init(g_cfg.modbus.baud, g_cfg.modbus.parity, g_cfg.modbus.stop_bits);
+            LOG_INFO("ModbusModule: RS485 tunnel master @%u baud -> node 0x%08x (gap %ums)",
+                     (unsigned)g_cfg.modbus.baud, (unsigned)g_cfg.tunnel.peer_node,
+                     (unsigned)g_cfg.tunnel.idle_gap_ms);
+#endif
+            tunLen = 0;
+        }
+        return tunnelPump();
+    }
 
     // RS485 polling turned off (e.g. no sensor wired) — stay idle, but keep
     // checking so a config push can re-enable it without a reboot.
@@ -134,32 +199,330 @@ ProcessMessage ModbusModule::handleReceived(const meshtastic_MeshPacket &mp)
         return ProcessMessage::CONTINUE;
     }
 
+    // BLE TX power: 'S','Q','P' + int8 dBm. Set the radio power live and persist it to
+    // a separate key (not the config blob). No reboot. byte[2]='P' (0x50) is distinct
+    // from a config version / '?' / '>' / '}'.
+    if (n >= 4 && b[0] == 'S' && b[1] == 'Q' && b[2] == 'P') {
+        applyBlePower((int)(int8_t)b[3], true);
+        return ProcessMessage::CONTINUE;
+    }
+
+    // Capability query: 'S','Q','V','?' → reply 'S','Q','V', proto, max_blob_ver,
+    // features, fw_len, fw[…]. Lets the configurator show the real product firmware
+    // and gate/verify features. byte[2]='V' (0x56); the trailing '?' distinguishes a
+    // query from the reply, so a node never acts on another node's reply.
+    if (n >= 4 && b[0] == 'S' && b[1] == 'Q' && b[2] == 'V' && b[3] == '?') {
+        uint8_t r[8 + sizeof(SQ_FW_VERSION)];
+        const char *fw = SQ_FW_VERSION;
+        uint8_t fl = (uint8_t)strlen(fw);
+        size_t i = 0;
+        r[i++] = 'S'; r[i++] = 'Q'; r[i++] = 'V';
+        r[i++] = SQ_CAP_PROTO;
+        r[i++] = SQ_CONFIG_VERSION;
+        r[i++] = SQ_FEATURES;
+        r[i++] = fl;
+        memcpy(r + i, fw, fl); i += fl;
+        LOG_INFO("ModbusModule: capability query → fw %s, blob v%u, feat 0x%02x",
+                 fw, (unsigned)SQ_CONFIG_VERSION, (unsigned)SQ_FEATURES);
+        sendSqReply(r, i, mp.from, mp.channel);
+        return ProcessMessage::CONTINUE;
+    }
+
+    // RS485 raw-bridge request: write the following bytes to RS485 and return the
+    // reply. Two distinct callers share this path but use DIFFERENT command/reply
+    // markers so they never cross (e.g. when both target the same peer):
+    //   'S','Q','>'  USB↔RS485 tool (manual / configurator)  → reply 'S','Q','<'
+    //   'S','Q','}'  RS485↔RS485 tunnel (autonomous master)  → reply 'S','Q','{'
+    // byte[2] here (0x3E / 0x7D) can't collide with a config blob (byte[2]=version)
+    // or poll-now ('?').
+    if (n >= 3 && b[0] == 'S' && b[1] == 'Q' && (b[2] == '>' || b[2] == '}')) {
+        // Only act if this request is for US: addressed to our node or broadcast.
+        // Otherwise it's a packet the local node merely originates — transmit it,
+        // don't run it against our own RS485.
+        const uint32_t self = nodeDB->getNodeNum();
+        if (mp.to == self || mp.to == NODENUM_BROADCAST) {
+            // Local injection (from == self) → reply to USB only (no RF). A genuine
+            // remote requester → reply over the mesh, unicast back on its channel.
+            const bool local = (mp.from == 0 || mp.from == self);
+            const uint8_t replyMarker = (b[2] == '}') ? '{' : '<';
+            rawBridge(b + 3, n - 3, mp.from, mp.channel, local, replyMarker);
+        }
+        return ProcessMessage::CONTINUE;
+    }
+
+    // RS485↔RS485 tunnel reply: our peer answered a forwarded frame with 'SQ{' + raw
+    // bytes. Write them straight back out our LOCAL RS485 to the master. Only when we
+    // are the tunnel master and only from our configured peer. The distinct '{' marker
+    // (vs the USB tool's '<') means a manual USB probe of the same peer is NOT mistaken
+    // for a tunnel reply and injected onto our bus.
+    if (g_cfg.tunnel.enabled && n >= 3 && b[0] == 'S' && b[1] == 'Q' && b[2] == '{' &&
+        mp.from == g_cfg.tunnel.peer_node) {
+        tunnelWriteback(b + 3, n - 3);
+        return ProcessMessage::CONTINUE;
+    }
+
+#ifdef SQ_USB_TUNNEL
+    // USB↔USB pipe: the peer pushed data 'SQ~' + raw bytes — write it straight to our
+    // local USB. Symmetric (both ends do this); no reply.
+    if (g_cfg.tunnel.enabled && n >= 3 && b[0] == 'S' && b[1] == 'Q' && b[2] == '~' &&
+        mp.from == g_cfg.tunnel.peer_node) {
+        tunnelWriteback(b + 3, n - 3);
+        return ProcessMessage::CONTINUE;
+    }
+#endif
+
     if (n < 4 || b[0] != 'S' || b[1] != 'Q')
         return ProcessMessage::CONTINUE;
 
-    applyConfigBlob(b, n, mp.from);
+    // Only a small integer at byte[2] is a config-blob version (2..15). Everything
+    // else 'SQ*' is a command/reply marker (all ASCII, ≥0x20) — our own 'SQ<' / 'SQ{'
+    // / 'SQ!' / 'SQ V' replies included — so skip it: no spurious NAK, no reply loop.
+    if (b[2] < 2 || b[2] > 15)
+        return ProcessMessage::CONTINUE;
+
+    applyConfigBlob(b, n, mp.from);   // applies + replies 'SQ!' with the apply status
     return ProcessMessage::CONTINUE;
 }
 
 void ModbusModule::applyConfigBlob(const uint8_t *blob, size_t len, uint32_t from)
 {
+    // Status codes echoed back to the configurator in the 'SQ!' reply:
+    //   0 = applied, 1 = invalid (bad magic / unknown version / length / CRC),
+    //   2 = valid but failed to persist.
+    uint8_t status;
     sq_config_t incoming = g_cfg;   // preserve fields the blob doesn't carry (LoRaWAN keys)
     if (!config_from_blob(&incoming, blob, len)) {
-        LOG_DEBUG("ModbusModule: rx %u bytes on portnum not a valid config blob; ignored",
+        LOG_DEBUG("ModbusModule: rx %u bytes on portnum not a valid config blob; NAK",
                   (unsigned)len);
-        return;
-    }
-    if (!config_save(&incoming)) {
+        status = 1;
+    } else if (!config_save(&incoming)) {
         LOG_WARN("ModbusModule: config blob valid but save failed");
-        return;
+        status = 2;
+    } else {
+        g_cfg = incoming;
+        // Re-init the UART so a changed baud/parity takes effect without a reboot.
+        hal_serial_init(g_cfg.modbus.baud, g_cfg.modbus.parity, g_cfg.modbus.stop_bits);
+        LOG_INFO("ModbusModule: config updated over mesh from 0x%08x — %u poll(s), baud %u",
+                 (unsigned)from, g_cfg.poll_count, (unsigned)g_cfg.modbus.baud);
+        status = 0;
     }
-    g_cfg = incoming;
-    // Re-init the UART so a changed baud/parity takes effect without a reboot.
-    hal_serial_init(g_cfg.modbus.baud, g_cfg.modbus.parity, g_cfg.modbus.stop_bits);
-    LOG_INFO("ModbusModule: config updated over mesh from 0x%08x — %u poll(s), baud %u",
-             (unsigned)from, g_cfg.poll_count, (unsigned)g_cfg.modbus.baud);
-    // Sender requested an ACK at the mesh-routing layer if it wanted delivery proof;
-    // no app-level reply on this port (would look like telemetry to the cloud).
+    // App-level ACK/NAK so the configurator knows the node actually accepted it
+    // (older firmware without this simply won't reply → the UI shows "unconfirmed").
+    const uint8_t r[4] = { 'S', 'Q', '!', status };
+    sendSqReply(r, sizeof(r), from, 0);
+}
+
+void ModbusModule::sendSqReply(const uint8_t *data, size_t len, uint32_t from, uint8_t channel)
+{
+    meshtastic_MeshPacket *p = allocDataPacket();
+    if (!p)
+        return;
+    p->want_ack = false;
+    memcpy(p->decoded.payload.bytes, data, len);
+    p->decoded.payload.size = len;
+    const uint32_t self = nodeDB->getNodeNum();
+    if (from == 0 || from == self) {
+        // Provisioned locally over USB/BLE → deliver straight to the client, no RF.
+        p->from = self;
+        service->sendToPhone(p);
+    } else {
+        // Provisioned by a remote node over the mesh → unicast the reply back to it.
+        p->to = from;
+        p->channel = channel;
+        service->sendToMesh(p, RX_SRC_LOCAL, true);
+    }
+}
+
+void ModbusModule::rawBridge(const uint8_t *req, size_t reqlen, uint32_t replyTo, uint8_t channel,
+                             bool local, uint8_t replyMarker)
+{
+    // The request carries its own link params so the converter is independent of
+    // the polling config: a 6-byte header  baud(u32 LE) parity(u8) stop(u8)  then
+    // the raw bytes to put on the wire. (Shorter request ⇒ legacy: use g_cfg.)
+    uint32_t     baud = g_cfg.modbus.baud;
+    hal_parity_t par  = g_cfg.modbus.parity;
+    uint8_t      stop = g_cfg.modbus.stop_bits;
+    const uint8_t *data = req;
+    size_t         datalen = reqlen;
+    if (reqlen >= 6) {
+        baud = (uint32_t)req[0] | ((uint32_t)req[1] << 8) | ((uint32_t)req[2] << 16) | ((uint32_t)req[3] << 24);
+        par  = (hal_parity_t)req[4];
+        stop = req[5] ? req[5] : 1;
+        data = req + 6;
+        datalen = reqlen - 6;
+    }
+
+    // Bring the RS485 UART up at the requested link params (the periodic poller may
+    // be disabled or not yet have run, but the bridge must work regardless).
+    hal_serial_init(baud, par, stop);
+
+    // Drive DE, put the caller's bytes on the wire, then drop back to receive.
+    hal_serial_set_tx(true);
+    if (datalen)
+        hal_serial_write(data, datalen);
+    hal_serial_flush();
+    hal_serial_set_tx(false);
+
+    const uint32_t to = g_cfg.modbus.response_timeout_ms ? g_cfg.modbus.response_timeout_ms : 500;
+
+    // On half-duplex boards that echo TX (/RE tied low) discard our own bytes first.
+    size_t echo = BOARD.rs485_tx_echo ? datalen : 0;
+    uint8_t scratch[64];
+    while (echo) {
+        int n = hal_serial_read(scratch, echo < sizeof(scratch) ? echo : sizeof(scratch), to);
+        if (n <= 0)
+            break;
+        echo -= (size_t)n;
+    }
+
+    // Reply = 'S','Q','<' + raw slave bytes, so the configurator can tell a bridge
+    // reply from periodic Modbus telemetry. Wait the response window for the first
+    // byte, then drain until a short inter-byte gap marks the end of the frame.
+    uint8_t reply[meshtastic_Constants_DATA_PAYLOAD_LEN];
+    reply[0] = 'S';
+    reply[1] = 'Q';
+    reply[2] = replyMarker;   // '<' for the USB tool, '{' for the tunnel
+    const size_t cap = sizeof(reply) - 3;
+    size_t got = 0;
+    int n = hal_serial_read(reply + 3, cap, to);
+    if (n > 0) {
+        got = (size_t)n;
+        while (got < cap) {
+            int m = hal_serial_read(reply + 3 + got, cap - got, 25);
+            if (m <= 0)
+                break;
+            got += (size_t)m;
+        }
+    }
+
+    char hx[2 * 16 + 1];
+    size_t hn = got < 16 ? got : 16;
+    for (size_t i = 0; i < hn; i++)
+        snprintf(hx + 2 * i, 3, "%02x", reply[3 + i]);
+    hx[2 * hn] = 0;
+    LOG_INFO("ModbusModule: USB<->RS485 bridge @%u baud, tx %u -> rx %u bytes: %s",
+             (unsigned)baud, (unsigned)datalen, (unsigned)got, hx);
+
+    // Restore the poller's configured link params if the bridge changed them, so
+    // the next periodic Modbus read still runs at the provisioned baud/parity.
+    if (baud != g_cfg.modbus.baud || par != g_cfg.modbus.parity || stop != g_cfg.modbus.stop_bits)
+        hal_serial_init(g_cfg.modbus.baud, g_cfg.modbus.parity, g_cfg.modbus.stop_bits);
+
+    // Always reply (got == 0 ⇒ the UI shows "no reply").
+    meshtastic_MeshPacket *p = allocDataPacket();
+    if (!p)
+        return;
+    p->want_ack = false;
+    memcpy(p->decoded.payload.bytes, reply, 3 + got);
+    p->decoded.payload.size = 3 + got;
+    if (local) {
+        // Locally-driven converter: deliver ONLY to the USB/BLE client. sendToPhone()
+        // queues straight to the local API with no RF transmit — no LoRa airtime.
+        p->from = nodeDB->getNodeNum();
+        service->sendToPhone(p);
+    } else {
+        // Remote-driven: unicast the reply back over the mesh to the requester, on the
+        // channel the request came in on, so it reaches the originator's configurator.
+        p->to = replyTo;
+        p->channel = channel;
+        service->sendToMesh(p, RX_SRC_LOCAL, true);   // + cc to a phone here, if any
+    }
+}
+
+/* ── Transparent tunnel (master side) ──────────────────────────────────────────
+   Reads raw bytes off the LOCAL port (RS485, or the USB CDC in the SQ_USB_TUNNEL
+   build), frames them by idle gap (protocol-agnostic — works for non-Modbus devices
+   too), and forwards each frame to the peer node. The peer answers via the raw-bridge
+   path; the reply is written back to the local port by tunnelWriteback(). Non-blocking:
+   polls the port in small windows so the main thread isn't starved. */
+int32_t ModbusModule::tunnelPump()
+{
+    const size_t cap = meshtastic_Constants_DATA_PAYLOAD_LEN - 9;   // room after 'SQ}'+linkhdr
+    uint8_t tmp[128];
+    int n = tun_read(tmp, sizeof(tmp));
+    uint32_t now = hal_millis();
+    if (n > 0) {
+        size_t room = (tunLen < cap) ? (cap - tunLen) : 0;
+        size_t take = ((size_t)n < room) ? (size_t)n : room;
+        memcpy(tunBuf + tunLen, tmp, take);
+        tunLen += take;
+        tunLastByte = now;
+        if (tunLen >= cap)                  // frame at the size limit — flush now
+            forwardTunnel();
+        return 2;                           // more bytes likely still arriving
+    }
+    if (tunLen > 0 && (now - tunLastByte) >= g_cfg.tunnel.idle_gap_ms) {
+        forwardTunnel();                    // idle gap on the bus → end of frame
+        return 2;
+    }
+    return tunLen ? 2 : 10;                 // mid-frame: poll fast; idle: relax
+}
+
+void ModbusModule::forwardTunnel()
+{
+    if (tunLen == 0)
+        return;
+    meshtastic_MeshPacket *p = allocDataPacket();
+    if (p) {
+        uint8_t *d = p->decoded.payload.bytes;
+#ifdef SQ_USB_TUNNEL
+        // USB↔USB pipe: a symmetric one-way data push 'S','Q','~' + raw bytes. The peer
+        // (also a USB-tunnel node) writes them straight to ITS USB — no RS485, no reply.
+        d[0] = 'S'; d[1] = 'Q'; d[2] = '~';
+        memcpy(d + 3, tunBuf, tunLen);
+        p->decoded.payload.size = (pb_size_t)(3 + tunLen);
+#else
+        // RS485 tunnel: 'S','Q','}' + link header (baud u32 LE, parity u8, stop u8) + the
+        // raw frame. The peer's raw-bridge runs it on RS485 and replies with marker '{'.
+        const uint32_t baud = g_cfg.modbus.baud;
+        d[0] = 'S'; d[1] = 'Q'; d[2] = '}';
+        d[3] = baud & 0xff; d[4] = (baud >> 8) & 0xff; d[5] = (baud >> 16) & 0xff; d[6] = (baud >> 24) & 0xff;
+        d[7] = (uint8_t)g_cfg.modbus.parity; d[8] = g_cfg.modbus.stop_bits;
+        memcpy(d + 9, tunBuf, tunLen);
+        p->decoded.payload.size = (pb_size_t)(9 + tunLen);
+#endif
+        p->want_ack = false;
+        p->to = g_cfg.tunnel.peer_node;
+        p->channel = g_cfg.tx.channel;
+        service->sendToMesh(p, RX_SRC_LOCAL, false);   // unicast to the peer over the mesh
+        LOG_INFO("ModbusModule: tunnel fwd %u bytes -> 0x%08x", (unsigned)tunLen,
+                 (unsigned)g_cfg.tunnel.peer_node);
+    }
+    tunLen = 0;
+}
+
+void ModbusModule::tunnelWriteback(const uint8_t *data, size_t len)
+{
+    if (len == 0)
+        return;
+    tun_write(data, len);   // RS485 (DE + echo-discard) or plain USB CDC write
+    tunLen = 0;             // drop any partial the framer accumulated during the writeback
+    LOG_INFO("ModbusModule: tunnel writeback %u bytes -> local port", (unsigned)len);
+}
+
+void ModbusModule::applyBlePower(int dbm, bool persist)
+{
+    // This NimBLE/IDF build only exposes setPower(esp_power_level_t), so map the dBm
+    // to the nearest 3 dB step. Regulatory note: BLE is 2.4 GHz — don't run at max
+    // for production (NCC/FCC EIRP).
+    esp_power_level_t lvl;
+    switch (dbm) {
+    case -12: lvl = ESP_PWR_LVL_N12; break;
+    case -9:  lvl = ESP_PWR_LVL_N9;  break;
+    case -6:  lvl = ESP_PWR_LVL_N6;  break;
+    case -3:  lvl = ESP_PWR_LVL_N3;  break;
+    case 3:   lvl = ESP_PWR_LVL_P3;  break;
+    case 6:   lvl = ESP_PWR_LVL_P6;  break;
+    case 9:   lvl = ESP_PWR_LVL_P9;  break;
+    default:  lvl = ESP_PWR_LVL_N0; dbm = 0; break;   // 0 dBm
+    }
+    NimBLEDevice::setPower(lvl);
+    if (persist) {
+        int8_t v = (int8_t)dbm;
+        hal_store_set("blepwr", &v, sizeof(v));
+        hal_store_commit();
+    }
+    LOG_INFO("ModbusModule: BLE TX power %d dBm%s", dbm, persist ? " (saved)" : "");
 }
 
 #endif // SQC485IV2

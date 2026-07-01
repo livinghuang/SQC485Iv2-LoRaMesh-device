@@ -46,6 +46,34 @@ class ModbusModule : public SinglePortModule, private concurrency::OSThread
     bool firstTime = true;
     void pollAndSend();          // uses the shared firmware_core engine
     void applyConfigBlob(const uint8_t *blob, size_t len, uint32_t from);
+
+    // Capability/ACK replies ('SQ V' report, 'SQ !' config apply status): to the local
+    // USB/BLE client when from==self, else unicast back to the requester over the mesh.
+    void sendSqReply(const uint8_t *data, size_t len, uint32_t from, uint8_t channel);
+
+    // RS485↔RS485 transparent tunnel (master side). tunnelPump() reads the local bus
+    // and forwardTunnel() ships each idle-gap-framed frame to the peer; the peer's
+    // reply is written back to the local bus by tunnelWriteback().
+    int32_t tunnelPump();
+    void    forwardTunnel();
+    void    tunnelWriteback(const uint8_t *data, size_t len);
+    uint8_t  tunBuf[233];        // accumulating frame from the local RS485
+    size_t   tunLen = 0;
+    uint32_t tunLastByte = 0;    // hal_millis() of the last byte (idle-gap framing)
+
+    // BLE TX power (set via the 'SQ P' command; persisted to a separate store key and
+    // re-applied once at startup).
+    bool blePowerApplied = false;
+    void applyBlePower(int dbm, bool persist);
+
+    // USB↔RS485 transparent bridge: write the caller's raw bytes to the RS485 line
+    // and return whatever the slave replies. local=true → reply to the USB client
+    // only (no RF); local=false → unicast the reply back over the mesh to replyTo on
+    // the given channel (so a remote node can be driven from another node's USB).
+    // replyMarker is the 3rd reply byte ('<' for the USB tool, '{' for the tunnel) so
+    // the two paths never cross even when they target the same peer.
+    void rawBridge(const uint8_t *req, size_t reqlen, uint32_t replyTo, uint8_t channel,
+                   bool local, uint8_t replyMarker);
 };
 
 extern ModbusModule *modbusModule;

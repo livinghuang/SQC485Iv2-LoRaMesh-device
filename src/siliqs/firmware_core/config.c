@@ -84,6 +84,10 @@ void config_set_defaults(sq_config_t *c)
     c->tx.dest_node = 0;   /* broadcast */
     c->tx.channel   = 0;   /* primary */
     c->rs485_enabled = true;
+
+    c->tunnel.enabled     = false;
+    c->tunnel.peer_node   = 0;
+    c->tunnel.idle_gap_ms = 20;   /* ~end-of-frame silence on the local bus */
 }
 
 bool config_load(sq_config_t *c)
@@ -119,12 +123,14 @@ static uint32_t get_u32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p
 
 size_t config_to_blob(const sq_config_t *c, uint8_t *out, size_t cap)
 {
-    /* v3 appends tx routing (dest_node u32 + channel u8 = 5 bytes) after the polls. */
-    size_t need = SQ_BLOB_HDR + (size_t)c->poll_count * 6 + 5 + 2;
+    /* v3 appends tx routing (dest_node u32 + channel u8 = 5 bytes); v4 then appends
+       the tunnel block (peer_node u32 + idle_gap u16 = 6 bytes) after the polls. */
+    size_t need = SQ_BLOB_HDR + (size_t)c->poll_count * 6 + 5 + 6 + 2;
     if (need > cap) return 0;
 
     out[0] = 'S'; out[1] = 'Q'; out[2] = SQ_CONFIG_VERSION & 0xFF;
-    out[3] = c->rs485_enabled ? 0 : SQ_FLAG_RS485_OFF;   /* flags */
+    out[3] = (c->rs485_enabled ? 0 : SQ_FLAG_RS485_OFF)      /* flags */
+           | (c->tunnel.enabled ? SQ_FLAG_TUNNEL_ON : 0);
     memset(out + 4, 0, 16);
     for (int i = 0; i < 16 && c->device_name[i]; i++) out[4 + i] = (uint8_t)c->device_name[i];
     put_u32(out + 20, c->modbus.baud);
@@ -146,6 +152,9 @@ size_t config_to_blob(const sq_config_t *c, uint8_t *out, size_t cap)
     uint8_t *t = out + SQ_BLOB_HDR + (size_t)c->poll_count * 6;   /* tx routing (v3) */
     put_u32(t, c->tx.dest_node);
     t[4] = c->tx.channel;
+    uint8_t *tn = t + 5;                                          /* tunnel block (v4) */
+    put_u32(tn, c->tunnel.peer_node);
+    put_u16(tn + 4, c->tunnel.idle_gap_ms);
     put_u16(out + need - 2, modbus_crc16(out, need - 2));
     return need;
 }
@@ -154,11 +163,11 @@ bool config_from_blob(sq_config_t *c, const uint8_t *b, size_t len)
 {
     if (len < SQ_BLOB_HDR + 2) return false;
     uint8_t ver = b[2];
-    if (b[0] != 'S' || b[1] != 'Q' || (ver != 2 && ver != 3)) return false;
+    if (b[0] != 'S' || b[1] != 'Q' || (ver != 2 && ver != 3 && ver != 4)) return false;
 
     uint8_t pc = b[36];
     if (pc > SQ_MAX_POLLS) return false;
-    size_t extra = (ver >= 3) ? 5 : 0;                       /* v3 tx routing block */
+    size_t extra = (ver >= 3 ? 5 : 0) + (ver >= 4 ? 6 : 0);   /* v3 tx routing + v4 tunnel */
     size_t need = SQ_BLOB_HDR + (size_t)pc * 6 + extra + 2;
     if (len != need) return false;
     if (get_u16(b + need - 2) != modbus_crc16(b, need - 2)) return false;
@@ -195,6 +204,16 @@ bool config_from_blob(sq_config_t *c, const uint8_t *b, size_t len)
     } else {
         c->tx.dest_node = 0;          /* v2 blob: broadcast on primary */
         c->tx.channel   = 0;
+    }
+    if (ver >= 4) {
+        const uint8_t *tn = b + SQ_BLOB_HDR + (size_t)pc * 6 + 5;
+        c->tunnel.enabled     = (b[3] & SQ_FLAG_TUNNEL_ON) ? true : false;
+        c->tunnel.peer_node   = get_u32(tn);
+        c->tunnel.idle_gap_ms = get_u16(tn + 4);
+    } else {
+        c->tunnel.enabled     = false;   /* v2/v3 blob: no tunnel */
+        c->tunnel.peer_node   = 0;
+        c->tunnel.idle_gap_ms = 20;
     }
     c->schema_version = SQ_CONFIG_VERSION;
     return true;

@@ -7,7 +7,21 @@
 #include <stdbool.h>
 #include "hal/hal_serial.h"   /* hal_parity_t */
 
-#define SQ_CONFIG_VERSION 3     /* v3: + tx routing (dest_node + channel); v2 still accepted */
+#define SQ_CONFIG_VERSION 4     /* v4: + RS485↔RS485 tunnel (peer + idle gap); v2/v3 still accepted */
+
+/* Capability handshake (configurator ⇄ node). The configurator sends 'S','Q','V','?'
+   and the node replies 'S','Q','V', proto, max_blob_ver, features, fw_len, fw[…] so
+   the UI can show the real product firmware and gate/verify features. Bump
+   SQ_FW_VERSION on every firmware release; bump SQ_CAP_PROTO only if this reply
+   format itself changes. */
+#define SQ_CAP_PROTO      1
+#define SQ_FW_VERSION     "1.0.0"
+#define SQ_FEAT_TUNNEL    0x01   /* RS485↔RS485 tunnel (blob v4)      */
+#define SQ_FEAT_BLE_POWER 0x02   /* 'SQ P' live BLE TX power          */
+#define SQ_FEAT_RS485_TERM 0x04  /* 'SQ>' USB/remote RS485 terminal   */
+#define SQ_FEAT_POLL_NOW  0x08   /* 'SQ?' poll-now                    */
+#define SQ_FEATURES (SQ_FEAT_TUNNEL | SQ_FEAT_BLE_POWER | SQ_FEAT_RS485_TERM | SQ_FEAT_POLL_NOW)
+
 #define SQ_MAX_POLLS      8
 #define SQ_MAX_REGS       16    /* registers per poll */
 #define SQ_NAME_LEN       24
@@ -67,6 +81,17 @@ typedef struct {
     uint8_t  channel;     /* mesh channel index (0 = primary) */
 } sq_tx_t;
 
+/* RS485↔RS485 transparent tunnel (Mesh version only). When enabled the node is a
+   "tunnel master": it reads raw frames off its LOCAL RS485 (idle-gap framed, any
+   protocol — not just Modbus), forwards them to peer_node over the mesh, and
+   writes the peer's reply back out the local RS485. The peer answers via the
+   existing raw-bridge path. Replaces periodic polling while enabled. */
+typedef struct {
+    bool     enabled;
+    uint32_t peer_node;     /* the remote node whose RS485 we tunnel to/from */
+    uint16_t idle_gap_ms;   /* silence on the local bus that marks end-of-frame */
+} sq_tunnel_t;
+
 typedef struct {
     uint16_t     schema_version;
     char         device_name[SQ_NAME_LEN];
@@ -77,10 +102,12 @@ typedef struct {
     sq_power_t   power;
     sq_tx_t      tx;                      /* telemetry destination (Mesh) */
     bool         rs485_enabled;          /* false = don't poll RS485 (no sensor wired) */
+    sq_tunnel_t  tunnel;                  /* RS485↔RS485 transparent tunnel (Mesh) */
 } sq_config_t;
 
 /* blob flags byte (offset 3) */
 #define SQ_FLAG_RS485_OFF 0x01
+#define SQ_FLAG_TUNNEL_ON 0x02
 
 void config_set_defaults(sq_config_t *c);
 bool config_load(sq_config_t *c);
