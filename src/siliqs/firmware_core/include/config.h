@@ -15,7 +15,7 @@
    SQ_FW_VERSION on every firmware release; bump SQ_CAP_PROTO only if this reply
    format itself changes. */
 #define SQ_CAP_PROTO      1
-#define SQ_FW_VERSION     "1.0.0"
+#define SQ_FW_VERSION     "1.0.1"
 #define SQ_FEAT_TUNNEL    0x01   /* RS485↔RS485 tunnel (blob v4)      */
 #define SQ_FEAT_BLE_POWER 0x02   /* 'SQ P' live BLE TX power          */
 #define SQ_FEAT_RS485_TERM 0x04  /* 'SQ>' USB/remote RS485 terminal   */
