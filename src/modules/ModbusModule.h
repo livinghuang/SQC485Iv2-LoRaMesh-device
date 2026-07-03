@@ -42,10 +42,31 @@ class ModbusModule : public SinglePortModule, private concurrency::OSThread
     // 'SQ' blob magic + CRC, which config_from_blob() validates.
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
 
+    // Also see ROUTING_APP packets so a Level-3 (#10) confirmed uplink can catch the
+    // ACK addressed back to us (request_id == our sent id). Our PortNum otherwise.
+    virtual bool wantPacket(const meshtastic_MeshPacket *p) override
+    {
+        return p->decoded.portnum == ourPortNum ||
+               p->decoded.portnum == meshtastic_PortNum_ROUTING_APP;
+    }
+
   private:
     bool firstTime = true;
     void pollAndSend();          // uses the shared firmware_core engine
     void applyConfigBlob(const uint8_t *blob, size_t len, uint32_t from);
+
+    // Epic G duty-cycle deep sleep for a "mute sensor" leaf. After the uplink is
+    // enqueued, runOnce() arms the sleep, waits for the send to settle, then powers
+    // the SX126x + MCU down for the interval (reboots on wake).
+    //   Level 4 (#9): broadcast, fire-and-forget → sleep once the radio TX drains.
+    //   Level 3 (#10): unicast want_ack to dest_node → sleep once the ACK lands (or
+    //                  the reliable-delivery retransmissions are exhausted).
+    int      sleepMode();        // 0 = stay awake, 3 = confirmed sleep, 4 = fire-and-forget sleep
+    void     enterDeepSleep();   // sleep radio + esp_deep_sleep for the interval (no return)
+    bool     sleepArmed = false; // uplink sent last cycle; waiting to settle before sleep
+    uint32_t sleepArmedAt = 0;   // hal_millis() when armed (drain / ACK-wait window)
+    uint32_t ackWaitId = 0;      // L3: id of the want_ack uplink we're waiting to be ACKed (0 = none)
+    bool     ackReceived = false;// L3: a routing ACK/NAK for ackWaitId came back
 
     // Capability/ACK replies ('SQ V' report, 'SQ !' config apply status): to the local
     // USB/BLE client when from==self, else unicast back to the requester over the mesh.

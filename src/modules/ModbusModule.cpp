@@ -26,7 +26,10 @@
 #include "NodeDB.h"
 #include "configuration.h"
 #include "main.h"
+#include "Router.h"              // generatePacketId() — Level-3 confirmed uplink id
+#include "RadioLibInterface.h"   // instance->isSending()/sleep() — Level-4 TX drain + radio sleep
 #include <NimBLEDevice.h>   // NimBLEDevice::setPower (BLE TX power control)
+#include <esp_sleep.h>      // esp_deep_sleep_start (Epic G Level 4 duty-cycle sleep, #9)
 
 extern "C" {
 #include "config.h"          // sq_config_t, config_load/save, config_from_blob
@@ -41,6 +44,18 @@ ModbusModule *modbusModule;
 
 // Shared config (loaded from our LittleFS store via hal_store in hal_meshtastic.cpp).
 static sq_config_t g_cfg;
+
+// Epic G Level 4 (#9): TX-drain window before deep sleep. MIN covers Meshtastic's
+// CSMA/tx-delay (~0.5–1s) so the broadcast actually starts before we cut power; MAX
+// is a ceiling so a wedged radio can't block the power-down indefinitely.
+static const uint32_t SQ_L4_MIN_DRAIN_MS = 1500;
+static const uint32_t SQ_L4_MAX_DRAIN_MS = 8000;
+
+// Epic G Level 3 (#10): max time to stay awake waiting for the confirmed-uplink ACK
+// before sleeping anyway. Covers ReliableRouter's NUM_RELIABLE_RETX (3) retransmits;
+// an early ACK sleeps sooner. If the collector is unreachable we burn this each cycle
+// — the documented cost of confirmed + deep sleep.
+static const uint32_t SQ_L3_ACK_WAIT_MS = 12000;
 
 // Tunnel source/sink. Default = the local RS485 (Serial1 via the HAL). In the
 // SQ_USB_TUNNEL build the source/sink is the USB CDC (Serial) instead — the console
@@ -91,9 +106,31 @@ int32_t ModbusModule::runOnce()
             applyBlePower((int)dbm, false);
     }
 
-    // Gateway nodes (CLIENT_MUTE) bridge the mesh to MQTT and must not poll RS485.
-    if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE)
-        return disable();
+    // Epic G duty-cycle deep sleep: a deep-sleep uplink was enqueued last cycle — now
+    // power down, once the send has settled. Split across runOnce() calls so we don't
+    // cut power mid-transmit. Level 3 waits for the confirmed-delivery ACK (early-out)
+    // or its retransmission window; Level 4 waits for the broadcast TX to drain.
+    if (sleepArmed) {
+        uint32_t waited = hal_millis() - sleepArmedAt;
+        if (ackWaitId) {   // Level 3: confirmed unicast — wait for the ACK
+            if (!ackReceived && waited < SQ_L3_ACK_WAIT_MS)
+                return 250;          // still awaiting ACK / retransmitting
+            LOG_INFO("ModbusModule: Level-3 uplink %s after %ums — sleeping",
+                     ackReceived ? "ACKed" : "NOT acked (retries exhausted)", (unsigned)waited);
+        } else {           // Level 4: fire-and-forget — wait for TX to drain
+            bool sending = RadioLibInterface::instance && RadioLibInterface::instance->isSending();
+            if (waited < SQ_L4_MIN_DRAIN_MS || (sending && waited < SQ_L4_MAX_DRAIN_MS))
+                return 250;          // still draining — re-check shortly
+        }
+        enterDeepSleep();           // sleeps radio + MCU for the interval; never returns
+    }
+
+    // Polling is gated by the config flag alone (g_cfg.rs485_enabled, below) — NOT by
+    // the mesh role. This lets a CLIENT_MUTE node still poll: a "mute sensor" (Epic G
+    // Level 2, #8) that sends its own readings but does NOT relay for the mesh. A
+    // gateway is just CLIENT_MUTE with rs485_enabled=false, so it still stays idle at
+    // the rs485_enabled check below (which already supports re-enable without reboot).
+    // (Was: force-disable whenever role==CLIENT_MUTE — that assumed CLIENT_MUTE==gateway.)
 
     // Tunnel master: instead of polling, read raw frames off the local port and
     // forward them to the peer (its reply is written back in handleReceived). The
@@ -135,8 +172,47 @@ int32_t ModbusModule::runOnce()
     }
 
     pollAndSend();
+
+    // The uplink is enqueued; if this is a sleeping leaf, arm deep sleep and let the
+    // send settle (handled at the top of the next runOnce) rather than staying awake
+    // for the whole interval. Only a CLIENT_MUTE leaf sleeps — see sleepMode().
+    if (sleepMode()) {
+        sleepArmed   = true;
+        sleepArmedAt = hal_millis();
+        return 250;
+    }
+
     // Mesh airtime is precious — the configured interval governs cadence.
     return (int32_t)g_cfg.power.uplink_interval_s * 1000;
+}
+
+// Epic G duty-cycle deep sleep applies only to a non-relaying leaf: deep_sleep
+// configured AND role CLIENT_MUTE (a CLIENT/router that slept would drop the mesh)
+// AND RS485 on (we only sleep after a real poll). Returns which flavour:
+//   3 = confirmed  (#10): unicast want_ack to dest_node, sleep after ACK/retries.
+//   4 = fire-and-forget (#9): broadcast, sleep after TX drains.
+//   0 = don't sleep. Confirmed needs a unicast dest_node (can't ack a broadcast) —
+// without one a "confirmed" config degrades to Level 4.
+int ModbusModule::sleepMode()
+{
+    if (!(g_cfg.power.deep_sleep && g_cfg.rs485_enabled &&
+          config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE))
+        return 0;
+    return (g_cfg.tx.confirmed && g_cfg.tx.dest_node) ? 3 : 4;
+}
+
+// Sleep the radio, then deep-sleep the MCU for the configured interval. On the ESP32
+// timer wake the chip reboots (setup() runs again) — so this never returns, and the
+// next boot polls once and sleeps again. Meshtastic's own sleep FSM is bypassed; this
+// path is reached only for a Level-4 leaf (level4Active()).
+void ModbusModule::enterDeepSleep()
+{
+    LOG_INFO("ModbusModule: Level-4 deep sleep %us (CLIENT_MUTE leaf) — radio+MCU down, reboots on wake",
+             (unsigned)g_cfg.power.uplink_interval_s);
+    if (RadioLibInterface::instance)
+        RadioLibInterface::instance->sleep();     // SX126x → sleep (µA), full reinit on reboot
+    esp_sleep_enable_timer_wakeup((uint64_t)g_cfg.power.uplink_interval_s * 1000000ULL);  // s → µs
+    esp_deep_sleep_start();                        // MCU powers down; no return
 }
 
 void ModbusModule::pollAndSend()
@@ -152,12 +228,23 @@ void ModbusModule::pollAndSend()
     meshtastic_MeshPacket *p = allocDataPacket();   // portnum set to ours by SinglePortModule
     if (!p)
         return;
-    p->want_ack = false;
     // Telemetry destination (config v3): unicast to a chosen node, or broadcast
     // (the allocDataPacket default); and the chosen mesh channel index.
     if (g_cfg.tx.dest_node)
         p->to = g_cfg.tx.dest_node;
     p->channel = g_cfg.tx.channel;
+    // Level 3 (#10): confirmed unicast — ask the mesh for a reliable-delivery ACK and
+    // remember this packet's id so we can watch for that ACK (ROUTING_APP, request_id)
+    // in handleReceived and sleep as soon as it lands. Only meaningful with a dest.
+    bool confirmed = g_cfg.tx.confirmed && g_cfg.tx.dest_node;
+    p->want_ack = confirmed;
+    if (confirmed) {
+        p->id       = generatePacketId();
+        ackWaitId   = p->id;
+        ackReceived = false;
+    } else {
+        ackWaitId = 0;
+    }
     memcpy(p->decoded.payload.bytes, payload, len);
     p->decoded.payload.size = len;
     // Log the payload hex (capped) — lets the installer see the actual forwarded
@@ -178,6 +265,18 @@ void ModbusModule::pollAndSend()
 
 ProcessMessage ModbusModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
+    // Level 3 (#10): the reliable-delivery ACK for our confirmed uplink comes back on
+    // ROUTING_APP, addressed to us, with request_id == the id we sent. Catching it lets
+    // enterDeepSleep happen as soon as delivery is confirmed instead of waiting out the
+    // full retransmission window. (wantPacket() opts us in to ROUTING_APP for this.)
+    if (mp.decoded.portnum == meshtastic_PortNum_ROUTING_APP) {
+        if (ackWaitId && mp.decoded.request_id == ackWaitId) {
+            ackReceived = true;
+            LOG_INFO("ModbusModule: Level-3 ACK for uplink id 0x%08x", (unsigned)ackWaitId);
+        }
+        return ProcessMessage::CONTINUE;
+    }
+
     // Config downlinks and our own telemetry uplinks share this PortNum, and we
     // CANNOT tell them apart by source: a companion app provisions by injecting
     // the config on the LOCAL node's Meshtastic API, so its packet is from==self,

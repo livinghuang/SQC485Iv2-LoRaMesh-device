@@ -15,12 +15,14 @@
    SQ_FW_VERSION on every firmware release; bump SQ_CAP_PROTO only if this reply
    format itself changes. */
 #define SQ_CAP_PROTO      1
-#define SQ_FW_VERSION     "1.0.1"
+#define SQ_FW_VERSION     "1.1.0"   /* 1.0.1 = TW DTS factory default; 1.1.0 = + deep sleep */
 #define SQ_FEAT_TUNNEL    0x01   /* RS485↔RS485 tunnel (blob v4)      */
 #define SQ_FEAT_BLE_POWER 0x02   /* 'SQ P' live BLE TX power          */
 #define SQ_FEAT_RS485_TERM 0x04  /* 'SQ>' USB/remote RS485 terminal   */
 #define SQ_FEAT_POLL_NOW  0x08   /* 'SQ?' poll-now                    */
-#define SQ_FEATURES (SQ_FEAT_TUNNEL | SQ_FEAT_BLE_POWER | SQ_FEAT_RS485_TERM | SQ_FEAT_POLL_NOW)
+#define SQ_FEAT_DEEP_SLEEP 0x10  /* Epic G L4: duty-cycle deep sleep (mute leaf, #9) */
+#define SQ_FEATURES (SQ_FEAT_TUNNEL | SQ_FEAT_BLE_POWER | SQ_FEAT_RS485_TERM | \
+                     SQ_FEAT_POLL_NOW | SQ_FEAT_DEEP_SLEEP)
 
 #define SQ_MAX_POLLS      8
 #define SQ_MAX_REGS       16    /* registers per poll */
@@ -79,6 +81,8 @@ typedef struct {
 typedef struct {
     uint32_t dest_node;   /* 0 = broadcast; else unicast to this node num */
     uint8_t  channel;     /* mesh channel index (0 = primary) */
+    bool     confirmed;   /* Mesh: want_ack unicast to dest_node (Epic G L3, #10). Only
+                             meaningful when dest_node != 0 (can't ack a broadcast). */
 } sq_tx_t;
 
 /* RS485↔RS485 transparent tunnel (Mesh version only). When enabled the node is a
@@ -108,6 +112,7 @@ typedef struct {
 /* blob flags byte (offset 3) */
 #define SQ_FLAG_RS485_OFF 0x01
 #define SQ_FLAG_TUNNEL_ON 0x02
+#define SQ_FLAG_CONFIRMED 0x04   /* Mesh: confirmed (want_ack) unicast uplink (L3, #10) */
 
 void config_set_defaults(sq_config_t *c);
 bool config_load(sq_config_t *c);
