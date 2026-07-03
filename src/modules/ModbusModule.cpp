@@ -367,6 +367,23 @@ ProcessMessage ModbusModule::handleReceived(const meshtastic_MeshPacket &mp)
         return ProcessMessage::CONTINUE;
     }
 
+    // Get-config query: 'S','Q','G','?' → reply 'S','Q','G' + the CURRENT config blob, so
+    // the configurator can read back what the node is actually set to (device mode from
+    // role + rs485/tunnel flags, sensor sub-mode from deep_sleep/confirmed, poll list,
+    // interval, dest) and SHOW it / pre-fill the form — so the user isn't guessing the
+    // node's state. byte[2]='G' (0x47) is >15 so the reply is never taken for a config
+    // write; the trailing '?' distinguishes a query from the reply.
+    if (n >= 4 && b[0] == 'S' && b[1] == 'Q' && b[2] == 'G' && b[3] == '?') {
+        uint8_t r[3 + 160];
+        r[0] = 'S'; r[1] = 'Q'; r[2] = 'G';
+        size_t bl = config_to_blob(&g_cfg, r + 3, sizeof(r) - 3);
+        if (bl) {
+            LOG_INFO("ModbusModule: get-config query → %u-byte config blob", (unsigned)bl);
+            sendSqReply(r, 3 + bl, mp.from, mp.channel);
+        }
+        return ProcessMessage::CONTINUE;
+    }
+
     // RS485 raw-bridge request: write the following bytes to RS485 and return the
     // reply. Two distinct callers share this path but use DIFFERENT command/reply
     // markers so they never cross (e.g. when both target the same peer):

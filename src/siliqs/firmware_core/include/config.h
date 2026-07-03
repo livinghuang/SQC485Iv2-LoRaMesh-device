@@ -15,14 +15,15 @@
    SQ_FW_VERSION on every firmware release; bump SQ_CAP_PROTO only if this reply
    format itself changes. */
 #define SQ_CAP_PROTO      1
-#define SQ_FW_VERSION     "1.2.3"
+#define SQ_FW_VERSION     "1.2.4"
 #define SQ_FEAT_TUNNEL    0x01   /* RS485↔RS485 tunnel (blob v4)      */
 #define SQ_FEAT_BLE_POWER 0x02   /* 'SQ P' live BLE TX power          */
 #define SQ_FEAT_RS485_TERM 0x04  /* 'SQ>' USB/remote RS485 terminal   */
 #define SQ_FEAT_POLL_NOW  0x08   /* 'SQ?' poll-now                    */
 #define SQ_FEAT_DEEP_SLEEP 0x10  /* Epic G L4: duty-cycle deep sleep (mute leaf, #9) */
+#define SQ_FEAT_GET_CONFIG 0x20  /* 'SQG?' read-back current config blob             */
 #define SQ_FEATURES (SQ_FEAT_TUNNEL | SQ_FEAT_BLE_POWER | SQ_FEAT_RS485_TERM | \
-                     SQ_FEAT_POLL_NOW | SQ_FEAT_DEEP_SLEEP)
+                     SQ_FEAT_POLL_NOW | SQ_FEAT_DEEP_SLEEP | SQ_FEAT_GET_CONFIG)
 
 #define SQ_MAX_POLLS      8
 #define SQ_MAX_REGS       16    /* registers per poll */
