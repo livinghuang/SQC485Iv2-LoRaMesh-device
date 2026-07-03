@@ -318,9 +318,8 @@ void setup()
     // step sags the rail below the C3 brownout threshold (~2.51V) and the node boot-
     // loops. Firmware can't fix a >0.8V sag (the real fix is bulk decoupling on 3.3V),
     // but it CAN shave the concurrent baseline so there's more headroom for the SX126x/
-    // BLE transient: run at a low CPU clock and keep the boot LED off during bring-up.
-    // We then STAY at 80 MHz for the whole runtime (the step back to 160 itself tripped
-    // the brownout on a very weak supply) — only the LED is lit once the radio is up.
+    // BLE transient: run the boot at a low CPU clock and keep the boot LED off, then
+    // restore full clock + LED once the radio is up (see near initLoRa below).
     setCpuFrequencyMhz(80);
 #endif
 
@@ -970,10 +969,10 @@ void setup()
     auto rIf = initLoRa();
 
 #ifdef SQC485IV2
-    // Radio is up. On a very weak supply even the step back 80->160 MHz tripped the
-    // brownout, so we STAY at 80 MHz for the whole runtime (on the C3, sleep.cpp does
-    // NOT touch the clock, so nothing bumps it back). Slightly slower CPU, much better
-    // supply headroom. Only light the boot LED now.
+    // Radio is up — the biggest RF bring-up transient is past. Restore full clock (we ran
+    // the boot at 80 MHz to shave the concurrent current for brownout headroom) and only
+    // now light the boot LED.
+    setCpuFrequencyMhz(160);
 #ifdef LED_POWER
     digitalWrite(LED_POWER, LED_STATE_ON);
 #endif
