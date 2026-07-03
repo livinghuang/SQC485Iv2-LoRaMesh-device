@@ -68,6 +68,14 @@ class ModbusModule : public SinglePortModule, private concurrency::OSThread
     uint32_t ackWaitId = 0;      // L3: id of the want_ack uplink we're waiting to be ACKed (0 = none)
     bool     ackReceived = false;// L3: a routing ACK/NAK for ackWaitId came back
 
+    // Keep a deep-sleep leaf awake while the configurator (USB/BLE) is attached, so it
+    // can be reconfigured; it resumes sleeping after you disconnect. Plus a post-reset
+    // grace window to give a configurator time to connect before the first sleep.
+    bool     clientConnected();  // a client is attached over the API (service->api_state)
+    bool     bootChecked = false;// one-shot: set the connect grace based on wake cause
+    uint32_t connectGraceUntil = 0;   // hal_millis() until which we defer sleep (post-reset)
+    bool     sleepSuppressedLogged = false;  // log "deferred" once per attach, not every cycle
+
     // Capability/ACK replies ('SQ V' report, 'SQ !' config apply status): to the local
     // USB/BLE client when from==self, else unicast back to the requester over the mesh.
     void sendSqReply(const uint8_t *data, size_t len, uint32_t from, uint8_t channel);

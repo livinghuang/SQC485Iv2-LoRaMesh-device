@@ -51,6 +51,11 @@ static sq_config_t g_cfg;
 static const uint32_t SQ_L4_MIN_DRAIN_MS = 1500;
 static const uint32_t SQ_L4_MAX_DRAIN_MS = 8000;
 
+// After a reset / power-on (someone plugged in USB or pressed reset), keep a deep-sleep
+// leaf awake this long so a configurator has time to connect before the first sleep. A
+// duty-cycle timer wake gets no grace (keeps the sensor cadence tight).
+static const uint32_t SQ_CONNECT_GRACE_MS = 30000;
+
 // Epic G Level 3 (#10): max time to stay awake waiting for the confirmed-uplink ACK
 // before sleeping anyway. Covers ReliableRouter's NUM_RELIABLE_RETX (3) retransmits;
 // an early ACK sleeps sooner. If the collector is unreachable we burn this each cycle
@@ -106,11 +111,26 @@ int32_t ModbusModule::runOnce()
             applyBlePower((int)dbm, false);
     }
 
+    // One-shot: on a reset / power-on (not a duty-cycle timer wake), open a grace window
+    // during which we won't deep-sleep — so a configurator can connect to a sleep node
+    // before it powers down again.
+    if (!bootChecked) {
+        bootChecked = true;
+        if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER)
+            connectGraceUntil = hal_millis() + SQ_CONNECT_GRACE_MS;
+    }
+
     // Epic G duty-cycle deep sleep: a deep-sleep uplink was enqueued last cycle — now
     // power down, once the send has settled. Split across runOnce() calls so we don't
     // cut power mid-transmit. Level 3 waits for the confirmed-delivery ACK (early-out)
     // or its retransmission window; Level 4 waits for the broadcast TX to drain.
     if (sleepArmed) {
+        // A configurator attached (or is still expected during the connect grace) after
+        // we armed — cancel the sleep and stay awake so it can reconfigure the node.
+        if (clientConnected() || hal_millis() < connectGraceUntil) {
+            sleepArmed = false; ackWaitId = 0;
+            return (int32_t)g_cfg.power.uplink_interval_s * 1000;
+        }
         uint32_t waited = hal_millis() - sleepArmedAt;
         if (ackWaitId) {   // Level 3: confirmed unicast — wait for the ACK
             if (!ackReceived && waited < SQ_L3_ACK_WAIT_MS)
@@ -176,14 +196,34 @@ int32_t ModbusModule::runOnce()
     // The uplink is enqueued; if this is a sleeping leaf, arm deep sleep and let the
     // send settle (handled at the top of the next runOnce) rather than staying awake
     // for the whole interval. Only a CLIENT_MUTE leaf sleeps — see sleepMode().
+    // BUT keep the node awake while a configurator is attached (or during the post-reset
+    // connect grace): poll on schedule but don't sleep, so it can be reconfigured. It
+    // resumes its configured duty-cycle sleep once the configurator disconnects.
     if (sleepMode()) {
-        sleepArmed   = true;
-        sleepArmedAt = hal_millis();
-        return 250;
+        if (clientConnected() || hal_millis() < connectGraceUntil) {
+            if (!sleepSuppressedLogged) {
+                LOG_INFO("ModbusModule: configurator attached — deep sleep deferred until you disconnect");
+                sleepSuppressedLogged = true;
+            }
+        } else {
+            sleepSuppressedLogged = false;
+            sleepArmed   = true;
+            sleepArmedAt = hal_millis();
+            return 250;
+        }
     }
 
     // Mesh airtime is precious — the configured interval governs cadence.
     return (int32_t)g_cfg.power.uplink_interval_s * 1000;
+}
+
+// True while a configurator/client is attached over the API (USB serial or BLE).
+// Meshtastic sets service->api_state to STATE_SERIAL/STATE_BLE while a client is
+// connected and back to STATE_DISCONNECTED when it closes or times out — so this
+// flips false shortly after the configurator disconnects, letting the node sleep.
+bool ModbusModule::clientConnected()
+{
+    return service && service->api_state != MeshService::STATE_DISCONNECTED;
 }
 
 // Epic G duty-cycle deep sleep applies only to a non-relaying leaf: deep_sleep
