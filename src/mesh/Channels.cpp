@@ -105,6 +105,10 @@ void Channels::initDefaultLoraConfig()
     loraConfig.spread_factor = 9;            // SF9
     loraConfig.coding_rate = 5;              // 4/5
     loraConfig.override_frequency = 922.5f;  // MHz, exact center (within TW 920–925)
+    loraConfig.tx_power = 17;                // 17 dBm (~50mW) instead of 0=region max (22dBm):
+                                             // lower TX current for brownout margin on weak
+                                             // supplies. Still legal (TW limit 0.5W/1W); trades
+                                             // some range. Factory default; user can raise it.
 #endif
 }
 
