@@ -473,6 +473,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define MESHTASTIC_EXCLUDE_TZ 1
 #endif
 
+// SQC485Iv2: exclude the Bluetooth stack entirely. The board is provisioned over USB
+// (Web Serial), not BLE; and on weak-supply units the BLE bring-up current step sags the
+// 3.3V rail below the brownout threshold at boot (boot-loop). Dropping BLE removes that
+// transient (and frees flash). Remove this to restore BLE on well-powered builds.
+#ifdef SQC485IV2
+#define MESHTASTIC_EXCLUDE_BLUETOOTH 1
+#endif
+
 // Turn off all optional modules
 #ifdef MESHTASTIC_EXCLUDE_MODULES
 #define MESHTASTIC_EXCLUDE_AUDIO 1
