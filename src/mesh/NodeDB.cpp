@@ -697,6 +697,14 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
     // default to bluetooth capability of platform as default
     config.bluetooth.enabled = true;
 #endif
+#ifdef SQC485IV2
+    // Siliqs SQC485Iv2 factory default: ship with Bluetooth OFF. A fielded RS485 gateway
+    // shouldn't advertise an open BLE reconfig surface out-of-box, and leaving BLE off on
+    // first boot also sidesteps the weak-supply BLE-bring-up brownout. BLE stays COMPILED
+    // IN (this is a runtime default, NOT MESHTASTIC_EXCLUDE_BLUETOOTH) so it can be turned
+    // back on from the configurator over USB whenever a deployment wants BLE provisioning.
+    config.bluetooth.enabled = false;
+#endif
     config.bluetooth.fixed_pin = defaultBLEPin;
 
 #if defined(ST7735_CS) || defined(USE_EINK) || defined(ILI9341_DRIVER) || defined(ILI9342_DRIVER) || defined(ST7789_CS) ||       \
