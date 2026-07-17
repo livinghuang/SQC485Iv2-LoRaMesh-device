@@ -347,13 +347,16 @@ ProcessMessage ModbusModule::handleReceived(const meshtastic_MeshPacket &mp)
     }
 
     // Capability query: 'S','Q','V','?' → reply 'S','Q','V', proto, max_blob_ver,
-    // features, fw_len, fw[…]. Lets the configurator show the real product firmware
-    // and gate/verify features. byte[2]='V' (0x56); the trailing '?' distinguishes a
-    // query from the reply, so a node never acts on another node's reply.
+    // features, fw_len, fw[…], pid_len, product_id[…]. Lets the configurator show the real
+    // product + firmware and gate/verify features. byte[2]='V' (0x56); the trailing '?'
+    // distinguishes a query from the reply, so a node never acts on another node's reply.
+    // (proto 2 appends product_id after fw; a proto-1 reader stops at fw and ignores it.)
     if (n >= 4 && b[0] == 'S' && b[1] == 'Q' && b[2] == 'V' && b[3] == '?') {
-        uint8_t r[8 + sizeof(SQ_FW_VERSION)];
         const char *fw = SQ_FW_VERSION;
+        const char *pid = SQ_PRODUCT_ID;
         uint8_t fl = (uint8_t)strlen(fw);
+        uint8_t pdl = (uint8_t)strlen(pid);
+        uint8_t r[9 + sizeof(SQ_FW_VERSION) + sizeof(SQ_PRODUCT_ID)];
         size_t i = 0;
         r[i++] = 'S'; r[i++] = 'Q'; r[i++] = 'V';
         r[i++] = SQ_CAP_PROTO;
@@ -361,8 +364,10 @@ ProcessMessage ModbusModule::handleReceived(const meshtastic_MeshPacket &mp)
         r[i++] = SQ_FEATURES;
         r[i++] = fl;
         memcpy(r + i, fw, fl); i += fl;
-        LOG_INFO("ModbusModule: capability query → fw %s, blob v%u, feat 0x%02x",
-                 fw, (unsigned)SQ_CONFIG_VERSION, (unsigned)SQ_FEATURES);
+        r[i++] = pdl;                         // product-id length (proto ≥ 2)
+        memcpy(r + i, pid, pdl); i += pdl;
+        LOG_INFO("ModbusModule: capability query → %s fw %s, blob v%u, feat 0x%02x",
+                 pid, fw, (unsigned)SQ_CONFIG_VERSION, (unsigned)SQ_FEATURES);
         sendSqReply(r, i, mp.from, mp.channel);
         return ProcessMessage::CONTINUE;
     }
