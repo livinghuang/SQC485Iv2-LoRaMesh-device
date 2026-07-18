@@ -38,6 +38,7 @@ extern "C" {
 #include "hal/hal_time.h"    // hal_millis (idle-gap framing for the RS485 tunnel)
 #include "hal/hal_store.h"   // persist the BLE TX power (separate key, not the blob)
 #include "board_profile.h"   // BOARD.rs485_tx_echo (strip half-duplex TX echo)
+void hal_led_idle_on(void);   // meshtastic HAL (hal_meshtastic.cpp): keep the status LED on while idle
 }
 
 ModbusModule *modbusModule;
@@ -173,10 +174,13 @@ int32_t ModbusModule::runOnce()
         return tunnelPump();
     }
 
-    // RS485 polling turned off (e.g. no sensor wired) — stay idle, but keep
-    // checking so a config push can re-enable it without a reboot.
-    if (!g_cfg.rs485_enabled)
+    // RS485 polling turned off (e.g. no sensor wired) — stay idle, but keep checking so a config
+    // push can re-enable it without a reboot. Keep the status LED on (GPIO2 held LOW) so an idle
+    // node still shows a lit LED instead of going dark.
+    if (!g_cfg.rs485_enabled) {
+        hal_led_idle_on();
         return 5000;
+    }
 
     if (firstTime) {
         firstTime = false;

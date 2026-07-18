@@ -49,6 +49,10 @@ extern "C" const board_profile_t BOARD = {
 // See reference_sqc485i_v233_rs485_pinout / docs/HW_BRINGUP_LOG.md.
 #define RS485_RE_PIN 2
 
+// GPIO2 doubles as the (active-LOW) status LED and the RS485 #RE line. Held LOW keeps the receiver
+// enabled AND lights the LED, so we keep it LOW whether polling or idle → the LED is a simple steady
+// "on = alive" indicator on this headless board.
+
 // ── hal_serial → Serial1 (RS485), DE on GPIO with board polarity ───────────────
 extern "C" bool hal_serial_init(uint32_t baud, hal_parity_t parity, uint8_t stop_bits)
 {
@@ -56,9 +60,18 @@ extern "C" bool hal_serial_init(uint32_t baud, hal_parity_t parity, uint8_t stop
     pinMode(RS485_DE_PIN, OUTPUT);
     digitalWrite(RS485_DE_PIN, BOARD.rs485_de_inverted ? HIGH : LOW); // idle = RX
     pinMode(RS485_RE_PIN, OUTPUT);
-    digitalWrite(RS485_RE_PIN, LOW);   // #RE held LOW = receiver always enabled
+    digitalWrite(RS485_RE_PIN, LOW);   // #RE held LOW = receiver enabled (LED on)
     Serial1.begin(baud, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
     return true;
+}
+
+// Called while RS485 polling is OFF: keep the status LED on (GPIO2 held LOW) so an idle node
+// (gateway/collector, or RS485 disabled) still shows a lit LED instead of going dark.
+extern "C" void hal_led_idle_on(void)
+{
+    static bool inited = false;
+    if (!inited) { pinMode(RS485_RE_PIN, OUTPUT); inited = true; }
+    digitalWrite(RS485_RE_PIN, LOW);
 }
 
 extern "C" void hal_serial_set_tx(bool enable)
